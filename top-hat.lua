@@ -6,7 +6,7 @@
 
 SCREEN_WIDTH = 240
 SCREEN_HEIGHT = 136
-local version = "0.2.4"
+local version = "0.2.5"
 local t = 0
 
 local play = "play"
@@ -37,14 +37,21 @@ local cursor_b = "  "
 local game = {}
 game.state = "title"
 game.gravity = .5
+game.debug = false
 game.shake = 0
 game.waves = 0
 game.wavei = 0
 game.ox = 0
+game.oy = 0
+game.done = false
+game.start_time = 0
+game.current_time = 0
+game.current_dialog = {}
+game.dialog_pointer = 0
 
 local player = {}
 player.x = 0
-player.y = 0
+player.y = 68
 player.w = 8
 player.h = 8
 player.c = 1
@@ -54,27 +61,43 @@ player.speed_y = 0
 player.jump = 6.5
 player.air = false
 player.air_time = 0
+player.terminal_velocity = 35
+player.locked = false
+player.lives = 5
 
 local palette = {}
 palette.black = 0
+palette.sky_blue = 13
 palette.white = 15
 
 local gmap = {}
 gmap.x = 0
 gmap.y = 0
-gmap.w = 60
+gmap.w = 90
 gmap.h = 17
 gmap.sx = 0
 gmap.sy = 0
 gmap.k = palette.black
 gmap.s = 2
 
+local dialog = {}
+dialog[0] = {
+    "Hello! Welcome to this lovely world!",
+    "As you might have noticed, there is a",
+    "timer ticking on the top left of the",
+    "screen.",
+    "That's how much time you have spent",
+    "on this level. The less time you",
+    "take, the more points you get!"
+}
+
+
 function load_palette()
-    PAL_ARNE16="0c0c1444243430346d4e4a4e854c30346524d04648757161597dced27d2c8595a16daa2cd2aa996dc2cadad45edeeed6"
+    local palette_string = "140c1c44243430346d4e4a4e854c30346524d04648757161597dced27d2c8595a16daa2cd2aa998ebed6dad45edeeed6"
     for i=0,15 do
-        r = tonumber(string.sub(PAL_ARNE16,i*6+1,i*6+2),16)
-        g = tonumber(string.sub(PAL_ARNE16,i*6+3,i*6+4),16)
-        b = tonumber(string.sub(PAL_ARNE16,i*6+5,i*6+6),16)
+        r = tonumber(string.sub(palette_string,i*6+1,i*6+2),16)
+        g = tonumber(string.sub(palette_string,i*6+3,i*6+4),16)
+        b = tonumber(string.sub(palette_string,i*6+5,i*6+6),16)
         poke(0x3FC0+(i*3)+0,r)
         poke(0x3FC0+(i*3)+1,g)
         poke(0x3FC0+(i*3)+2,b)
@@ -86,15 +109,14 @@ function set_border_color(color)
     poke(0x3FF8, color)
 end
 
-function shake_screen(duration)
+function shake_screen()
     -- 'Shake Screen' by Vadim
-    if duration > 0 then
+    if game.shake > 0 then
         poke(0x3ff9, math.random(-1,1))
         poke(0x3ff9+1, math.random(-1,1))
-        duration = duration - 1
-        if duration == 0 then memset(0x3ff9,0,2) end
+        game.shake = game.shake - 1
+        if game.shake == 0 then memset(0x3ff9,0,2) end
     end
-    return duration
 end
 
 function scanline(row)
@@ -107,12 +129,14 @@ function scanline(row)
 end
 
 function TIC()
-    cls(palette.black)
     if game.state == "title" then
+        cls(palette.black)
         title_screen()
     elseif game.state == "game" then
+        cls(palette.sky_blue)
         game_screen()
     elseif game.state == "settings" then
+        cls(palette.black)
         settings_screen()
     end
     print("v"..version, SCREEN_WIDTH - 40, 5, palette.white, true)
@@ -137,6 +161,7 @@ function title_screen()
     if cursor < 1 then cursor = 1 end
 
     if cursor == 1 and btnp(bttn.a) then
+        game.start_time = time()
         game.state = "game"
     elseif cursor == 2 and btnp(bttn.a) then
         game.state = "settings"
@@ -170,89 +195,184 @@ end
 function game_screen()
     map(gmap.x , gmap.y,
         gmap.w, gmap.h,
-        gmap.sx - game.ox,gmap.sy,
+        gmap.sx - game.ox, gmap.sy - game.oy,
         gmap.k, gmap.s)
-
-    game.shake = shake_screen(game.shake)
+    shake_screen(game.shake)
 
     local pc = 1
     local px = player.x / 16
     local py = player.y / 16
     local block_east = mget(px+1+1/16, py+15/16)
-    --spr(32, player.x + 17 - game.ox, player.y + 15, 0, player.s, 0, 0)
     local block_west = mget(px-1/16, py+15/16)
-    --spr(32, player.x - 1 - game.ox, player.y + 15, 0, player.s, 0, 0)
     local block_beneath_left = mget(px+1/16, py+1+1/16)
-    --spr(32, player.x + 1 - game.ox, player.y + 17, 0, player.s, 0, 0)
     local block_beneath_right = mget(px+15/16, py+1+1/16)
-    --spr(32, player.x + 15 - game.ox, player.y + 17, 0, player.s, 0, 0)
+    local block_behind = mget(px + 8/16, py + 8/16)
 
-    if btn(bttn.right) then
-        if is_not_solid(block_east) then player.x = player.x + player.speed_x end
-        if t % 5 == 0 then
-            player.c = player.c + 1
-            if player.c > 4 then player.c = 2 end
+    if not player.locked then
+        if btn(bttn.right) then
+            if is_not_solid(block_east) then player.x = player.x + player.speed_x end
+            if t % 5 == 0 then
+                player.c = player.c + 1
+                if player.c > 4 then player.c = 2 end
+            end
+            if player.c < 2 then player.c = 2 end
+            pc = player.c
+        elseif not player.locked and btn(bttn.left) then
+            if is_not_solid(block_west) then player.x = player.x - player.speed_x end
+            if t % 5 == 0 then
+                player.c = player.c - 1
+                if player.c < 2 then player.c = 4 end
+            end
+            if player.c < 2 then player.c = 2 end
+            pc = player.c
+        else
+            pc = 1
         end
-        if player.c < 2 then player.c = 2 end
-        pc = player.c
-    elseif btn(bttn.left) then
-        if is_not_solid(block_west) then player.x = player.x - player.speed_x end
-        if t % 5 == 0 then
-            player.c = player.c - 1
-            if player.c < 2 then player.c = 4 end
-        end
-        if player.c < 2 then player.c = 2 end
-        pc = player.c
-    else
-        pc = 1
-    end
-    if player.x < 0 then player.x = 0 end
+        if player.x < 0 then player.x = 0 end
 
-    if block_beneath_left == block_beneath_right
-    and is_not_solid(block_beneath_left) then
-        player.speed_y = player.speed_y - game.gravity
-        player.y = player.y - player.speed_y
-    else
-        player.air = false
-        player.speed_y = 0
-        local player_y_grid = player.y // 16 * 16
-        local player_y_mod = player.y % 16
-        if player.y > player_y_grid then
-            if player_y_mod > 0.8*16 then
-                player.y = player.y + 16 - player_y_mod
-            else
-                player.y = player_y_grid
+        if is_not_solid(block_beneath_left) and is_not_solid(block_beneath_right) then
+            player.speed_y = player.speed_y - game.gravity
+            player.y = player.y - player.speed_y
+        else
+            player.air = false
+            player.speed_y = 0
+            local player_y_grid = player.y // 16 * 16
+            local player_y_mod = player.y % 16
+            if player.y > player_y_grid then
+                if player_y_mod > 0.8*16 then
+                    player.y = player.y + 16 - player_y_mod
+                else
+                    player.y = player_y_grid
+                end
             end
         end
-    end
 
-    if player.speed_y > 0 then
-        if not btn(bttn.up) then
-            player.speed_y = player.speed_y - 2
-        elseif t - player.air_time > 10 then
-            player.speed_y = player.speed_y - 1
+        if player.speed_y > 0 then
+            if not btn(bttn.up) then
+                player.speed_y = player.speed_y - 2
+            elseif t - player.air_time > 10 then
+                player.speed_y = player.speed_y - 1
+            end
+        end
+
+        if player.speed_y > player.terminal_velocity then
+            player.speed_y = player.terminal_velocity
+        elseif player.speed_y < -player.terminal_velocity then
+            player.speed_y = -player.terminal_velocity
+        end
+
+        if btn(bttn.down) and not btn(bttn.right) and not btn(bttn.left) then
+            pc = 5
+        elseif btn(bttn.up) and not player.air then
+            player.air = true
+            player.air_time = t
+            player.speed_y = player.jump
+            player.y = player.y - player.speed_y
+        end
+
+        if btn(bttn.a) and block_behind == 34 then
+            player.x = player.x + 320
+            game.ox = game.ox + 20
+        end
+
+        if player.y > SCREEN_HEIGHT then
+            player.y = SCREEN_HEIGHT + 50
+            player.locked = true
+            game.shake = 20
+        end
+
+        if player.x - game.ox > SCREEN_WIDTH / 2 + 20 then
+            game.ox = game.ox + player.speed_x
+        elseif player.x - game.ox < SCREEN_WIDTH / 2 - 20 and game.ox > 0 then
+            game.ox = game.ox - player.speed_x
+        end
+        if player.y - game.oy > SCREEN_HEIGHT / 2 then
+            game.oy = game.oy + 1
+        elseif player.y - game.oy < SCREEN_HEIGHT / 2 then
+            game.oy = game.oy - 1
+        end
+
+        if block_behind == 160 and player.x == 63 then
+            player.locked = true
+            game.in_dialog = true
+            game.current_dialog = dialog[0]
+            game.shake = 10
+        end
+
+        spr(pc, player.x - game.ox, player.y - game.oy, 0, player.s, 0, 0)
+
+    elseif player.locked then
+        spr(pc, player.x - game.ox, player.y - game.oy, 0, player.s, 0, 0)
+
+        if game.in_dialog then
+            rect(10, SCREEN_HEIGHT/2 + 10, SCREEN_WIDTH - 20, SCREEN_HEIGHT/2 - 20, 0)
+            print(game.current_dialog[game.dialog_pointer + 1]
+            ..'\n\n'..game.current_dialog[game.dialog_pointer + 2]
+            ..'\n\n'..game.current_dialog[game.dialog_pointer + 3], 20, SCREEN_HEIGHT/2 + 20)
+
+            if btnp(bttn.a) then
+                game.dialog_pointer = game.dialog_pointer + 1
+                if not game.current_dialog[game.dialog_pointer+3] then
+                    player.x = player.x + player.speed_x
+                    game.dialog_pointer = 0
+                    player.locked = false
+                    game.in_dialog = false
+                end
+            end
+        elseif not game.in_dialog
+           and game.shake == 0
+           and game.waves == 0 then
+            player.x = 0
+            player.y = 68
+            game.ox = 0
+            game.oy = 0
+            player.locked = false
         end
     end
 
-    if btn(bttn.down) and not btn(bttn.right) and not btn(bttn.left) then
-        pc = 5
-    elseif btn(bttn.up) and not player.air then
-        player.air = true
-        player.air_time = t
-        player.speed_y = player.jump
-        player.y = player.y - player.speed_y
-    end
-    if player.y < 0 then player.y = 0 end
+    if not game.done then game.current_time = time() - game.start_time end
+    print(pretty_time(math.floor(game.current_time / 10)/100), 10, 10, 15, true)
 
-    if player.x - game.ox > SCREEN_WIDTH / 2 + 20 then
-        game.ox = game.ox + player.speed_x
-    elseif player.x - game.ox < SCREEN_WIDTH / 2 - 20 and game.ox > 0 then
-        game.ox = game.ox - player.speed_x
-    end
+    if game.debug then
+        if btnp(bttn.b) then
+            game.done = true
+        end
 
-    spr(pc, player.x - game.ox, player.y, 0, player.s, 0, 0)
+        print(player.x - game.ox, 50, 10, 10)
+        print(player.y - game.oy, 50, 20, 10)
+        print(player.speed_x, 100, 10, 15)
+        print(player.speed_y, 100, 20, 15)
+        print(block_west, 10, 10, 8)
+        print(block_east, 30, 10, 11)
+        print(block_beneath_left, 10, 20, 9)
+        print(block_beneath_right, 30, 20, 6)
+        print(block_behind, 20, 30, 2)
+        print(game.shake, 140, 10, 7)
+        print(game.waves, 140, 20, 7)
+        rect(player.x + 17 - game.ox, player.y + 15 - game.oy, 1, 1, 11) -- block east green
+        rect(player.x - 1 - game.ox, player.y + 15 - game.oy, 1, 1, 8) -- block west light blue
+        rect(player.x + 1 - game.ox, player.y + 17 - game.oy, 1, 1, 9) -- beneath left orange
+        rect(player.x + 15 - game.ox, player.y + 17 - game.oy, 1, 1, 6) -- beneath right red
+        rect(player.x + 8 - game.ox, player.y + 8 - game.oy, 1, 1, 2) -- behind dark blue
+    end
+end
+
+function pad(num)
+    if num < 10 then
+        return "0" .. num
+    end
+    return num .. ""
+end
+
+function pretty_time(ctime)
+    local floor_time = math.floor(ctime)
+    local ms = math.floor((ctime - floor_time) * 100)
+    local s = floor_time % 60
+    local m = math.floor(ctime / 60)
+    return pad(m) .. ":" .. pad(s) .. "." .. pad(ms)
 end
 
 function is_not_solid(block)
-    return block == 0 or block == 35 or block == 36 or block == 37
+    return block == 0
+        or block >= 128
 end
